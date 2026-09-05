@@ -7,6 +7,7 @@ import {
 	ProcessTerminal,
 	resolveEscapeTimeoutMs,
 } from "../src/terminal.ts";
+import { TuiAltScreen } from "../src/tui-alt-screen.ts";
 
 describe("resolveEscapeTimeoutMs", () => {
 	it("uses PI_TUI_ESC_TIMEOUT when configured", () => {
@@ -295,6 +296,233 @@ describe("ProcessTerminal dimensions", () => {
 			} else {
 				process.env.LINES = previousLines;
 			}
+		}
+	});
+});
+
+describe("ProcessTerminal autowrap and raw-mode EPIPE guard", () => {
+	type Harness = {
+		terminal: ProcessTerminal;
+		writes: string[];
+		send(data: string): void;
+		cleanup(): void;
+	};
+
+	function setup(): Harness {
+		const terminal = new ProcessTerminal();
+		const writes: string[] = [];
+		let dataHandler: ((data: string) => void) | undefined;
+		const previousWrite = process.stdout.write;
+		const previousOn = process.stdin.on;
+		const previousStdoutOn = process.stdout.on;
+		const previousSetRawMode = process.stdin.setRawMode;
+		const previousSetEncoding = process.stdin.setEncoding;
+		const previousResume = process.stdin.resume;
+		const previousPause = process.stdin.pause;
+		const previousRemoveListener = process.stdin.removeListener;
+		const previousStdoutRemoveListener = process.stdout.removeListener;
+		const previousIsRawDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isRaw");
+
+		process.stdout.write = ((chunk: string | Uint8Array) => {
+			writes.push(String(chunk));
+			return true;
+		}) as typeof process.stdout.write;
+		process.stdout.on = (() => process.stdout) as unknown as typeof process.stdout.on;
+		process.stdout.removeListener = (() => process.stdout) as unknown as typeof process.stdout.removeListener;
+		Object.defineProperty(process.stdin, "isRaw", { value: false, configurable: true });
+		process.stdin.setRawMode = (() => true) as unknown as typeof process.stdin.setRawMode;
+		process.stdin.setEncoding = (() => process.stdin) as unknown as typeof process.stdin.setEncoding;
+		process.stdin.resume = (() => process.stdin) as unknown as typeof process.stdin.resume;
+		process.stdin.pause = (() => process.stdin) as unknown as typeof process.stdin.pause;
+		process.stdin.on = ((event: string | symbol, listener: (...args: unknown[]) => void) => {
+			if (event === "data") dataHandler = listener as (data: string) => void;
+			return process.stdin;
+		}) as unknown as typeof process.stdin.on;
+		process.stdin.removeListener = (() => process.stdin) as unknown as typeof process.stdin.removeListener;
+
+		return {
+			terminal,
+			writes,
+			send(data: string): void {
+				dataHandler?.(data);
+			},
+			cleanup(): void {
+				try {
+					// A test may have overridden setRawMode to throw (e.g. the re-throw case);
+					// reset it so stop() doesn't re-trigger the error during cleanup.
+					process.stdin.setRawMode = (() => true) as unknown as typeof process.stdin.setRawMode;
+					terminal.stop();
+				} finally {
+					process.stdout.write = previousWrite;
+					process.stdout.on = previousStdoutOn;
+					process.stdout.removeListener = previousStdoutRemoveListener;
+					if (previousIsRawDescriptor) {
+						Object.defineProperty(process.stdin, "isRaw", previousIsRawDescriptor);
+					}
+					process.stdin.setRawMode = previousSetRawMode;
+					process.stdin.setEncoding = previousSetEncoding;
+					process.stdin.resume = previousResume;
+					process.stdin.pause = previousPause;
+					process.stdin.on = previousOn;
+					process.stdin.removeListener = previousRemoveListener;
+					setKittyProtocolActive(false);
+				}
+			},
+		};
+	}
+
+	it("disables autowrap on start, queries DECAWM, and restores it on stop by default", () => {
+		const harness = setup();
+		try {
+			harness.terminal.start(
+				() => {},
+				() => {},
+			);
+			const queryIndex = harness.writes.indexOf("\x1b[?7$p");
+			const disableIndex = harness.writes.indexOf("\x1b[?7l");
+			assert.ok(queryIndex !== -1, "start() should query the original DECAWM state");
+			assert.ok(disableIndex > queryIndex, "start() should query DECAWM before disabling autowrap");
+
+			// With no DECRQM reply, stop() restores autowrap (safe default).
+			harness.writes.length = 0;
+			harness.terminal.stop();
+			assert.ok(harness.writes.includes("\x1b[?7h"), "stop() should restore DECAWM autowrap");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("leaves autowrap disabled on stop when the terminal reported it disabled", () => {
+		const harness = setup();
+		try {
+			harness.terminal.start(
+				() => {},
+				() => {},
+			);
+			// DECRQM reply: value 2 = reset (autowrap was already disabled, e.g. `tput rmam`).
+			harness.send("\x1b[?7;2$y");
+
+			harness.writes.length = 0;
+			harness.terminal.stop();
+			assert.ok(
+				!harness.writes.includes("\x1b[?7h"),
+				"stop() should not re-enable autowrap when it was already disabled",
+			);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("restores autowrap on stop when the terminal reported it enabled", () => {
+		const harness = setup();
+		try {
+			harness.terminal.start(
+				() => {},
+				() => {},
+			);
+			// DECRQM reply: value 1 = set (autowrap was enabled before Pi ran).
+			harness.send("\x1b[?7;1$y");
+
+			harness.writes.length = 0;
+			harness.terminal.stop();
+			assert.ok(harness.writes.includes("\x1b[?7h"), "stop() should restore autowrap when it was enabled on entry");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("keeps terminal state active while handing off to another renderer", () => {
+		const harness = setup();
+		try {
+			let firstInput = "";
+			let secondInput = "";
+			harness.terminal.start(
+				(data) => {
+					firstInput = data;
+				},
+				() => {},
+			);
+
+			harness.writes.length = 0;
+			harness.terminal.stop({ preserveState: true });
+			harness.terminal.start(
+				(data) => {
+					secondInput = data;
+				},
+				() => {},
+				{ preserveState: true },
+			);
+			harness.send("x");
+
+			assert.deepEqual(harness.writes, []);
+			assert.equal(firstInput, "");
+			assert.equal(secondInput, "x");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("queries autowrap before fullscreen disables it and restores the original enabled state", () => {
+		const harness = setup();
+		try {
+			const tui = new TuiAltScreen(harness.terminal);
+			tui.start();
+
+			const queryIndex = harness.writes.indexOf("\x1b[?7$p");
+			const disableIndex = harness.writes.indexOf("\x1b[?7l");
+			assert.ok(queryIndex !== -1, "fullscreen should query the original DECAWM state");
+			assert.ok(disableIndex > queryIndex, "fullscreen should disable autowrap after the query");
+
+			harness.writes.length = 0;
+			tui.stop();
+			assert.ok(harness.writes.includes("\x1b[?7h"), "fullscreen exit should restore enabled autowrap");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("does not re-enable autowrap after fullscreen when it was already disabled", () => {
+		const harness = setup();
+		try {
+			const tui = new TuiAltScreen(harness.terminal);
+			tui.start();
+			harness.send("\x1b[?7;2$y");
+
+			harness.writes.length = 0;
+			tui.stop();
+			assert.ok(!harness.writes.includes("\x1b[?7h"), "fullscreen exit should preserve disabled autowrap");
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("tolerates EPIPE when setting raw mode", () => {
+		const harness = setup();
+		try {
+			process.stdin.setRawMode = (() => {
+				const err = new Error("broken pipe") as NodeJS.ErrnoException;
+				err.code = "EPIPE";
+				throw err;
+			}) as unknown as typeof process.stdin.setRawMode;
+
+			assert.doesNotThrow(() =>
+				(harness.terminal as unknown as { setRawMode(mode: boolean): void }).setRawMode(true),
+			);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("re-throws non-EPIPE errors from setRawMode", () => {
+		const harness = setup();
+		try {
+			process.stdin.setRawMode = (() => {
+				throw new Error("boom");
+			}) as unknown as typeof process.stdin.setRawMode;
+
+			assert.throws(() => (harness.terminal as unknown as { setRawMode(mode: boolean): void }).setRawMode(true));
+		} finally {
+			harness.cleanup();
 		}
 	});
 });

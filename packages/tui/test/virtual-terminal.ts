@@ -1,6 +1,6 @@
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import xterm from "@xterm/headless";
-import type { Terminal } from "../src/terminal.ts";
+import type { Terminal, TerminalStartOptions, TerminalStopOptions } from "../src/terminal.ts";
 
 // Extract Terminal class from the module
 const XtermTerminal = xterm.Terminal;
@@ -14,6 +14,7 @@ export class VirtualTerminal implements Terminal {
 	private resizeHandler?: () => void;
 	private _columns: number;
 	private _rows: number;
+	private started = false;
 
 	constructor(columns = 80, rows = 24) {
 		this._columns = columns;
@@ -29,22 +30,26 @@ export class VirtualTerminal implements Terminal {
 		});
 	}
 
-	start(onInput: (data: string) => void, onResize: () => void): void {
+	start(onInput: (data: string) => void, onResize: () => void, options: TerminalStartOptions = {}): void {
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
+		if (options.preserveState && this.started) return;
 		// Enable bracketed paste mode for consistency with ProcessTerminal
 		this.xterm.write("\x1b[?2004h");
+		this.started = true;
 	}
 
 	async drainInput(_maxMs?: number, _idleMs?: number): Promise<void> {
 		// No-op for virtual terminal - no stdin to drain
 	}
 
-	stop(): void {
+	stop(options: TerminalStopOptions = {}): void {
+		if (options.preserveState) return;
 		// Disable bracketed paste mode
 		this.xterm.write("\x1b[?2004l");
 		this.inputHandler = undefined;
 		this.resizeHandler = undefined;
+		this.started = false;
 	}
 
 	write(data: string): void {

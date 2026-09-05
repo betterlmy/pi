@@ -417,9 +417,16 @@ export function compositeTuiLine(
 
 export type TuiMode = "regular" | "fullscreen";
 
+export interface TuiStartOptions {
+	/** Reuse an active terminal session from a renderer that just stopped. */
+	preserveTerminal?: boolean;
+}
+
 export interface TuiStopOptions {
 	/** Leave renderer output in place for another TUI taking over the same terminal. */
 	preserveScreen?: boolean;
+	/** Keep terminal state active for a replacement renderer. */
+	preserveTerminal?: boolean;
 }
 
 export interface TUI extends Component {
@@ -439,7 +446,7 @@ export interface TUI extends Component {
 	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle;
 	hideOverlay(): void;
 	hasOverlay(): boolean;
-	start(): void;
+	start(options?: TuiStartOptions): void;
 	stop(options?: TuiStopOptions): void;
 	renderNow(force?: boolean): void;
 	requestRender(force?: boolean): void;
@@ -875,12 +882,13 @@ export abstract class TuiBase extends Container implements TUI {
 		for (const overlay of this.overlayStack) overlay.component.invalidate();
 	}
 
-	start(): void {
+	start(options: TuiStartOptions = {}): void {
 		this.stopped = false;
 		this.beforeTerminalStart();
 		this.terminal.start(
 			(data) => this.handleTerminalInput(data),
 			() => this.requestRender(),
+			{ preserveState: options.preserveTerminal },
 		);
 		this.afterTerminalStart();
 		this.terminal.hideCursor();
@@ -936,8 +944,10 @@ export abstract class TuiBase extends Container implements TUI {
 			this.terminal.write("\x1b[?2031l");
 		}
 		this.beforeTerminalStop(options);
-		this.terminal.showCursor();
-		this.terminal.stop();
+		if (!options.preserveTerminal) {
+			this.terminal.showCursor();
+			this.terminal.stop();
+		}
 		this.afterTerminalStop(options);
 	}
 

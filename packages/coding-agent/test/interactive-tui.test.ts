@@ -1,4 +1,4 @@
-import type { Component, Terminal, TUI } from "@earendil-works/pi-tui";
+import type { Component, Terminal, TerminalStartOptions, TerminalStopOptions, TUI } from "@earendil-works/pi-tui";
 import { Container, getKeybindings, isViewportTUI, ScrollView, setKeybindings, Text } from "@earendil-works/pi-tui";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
@@ -23,9 +23,9 @@ class RecordingTerminal extends VirtualTerminal implements Terminal {
 	startCount = 0;
 	stopCount = 0;
 
-	override start(onInput: (data: string) => void, onResize: () => void): void {
+	override start(onInput: (data: string) => void, onResize: () => void, options?: TerminalStartOptions): void {
 		this.startCount += 1;
-		super.start(onInput, onResize);
+		super.start(onInput, onResize, options);
 	}
 
 	override write(data: string): void {
@@ -33,9 +33,9 @@ class RecordingTerminal extends VirtualTerminal implements Terminal {
 		super.write(data);
 	}
 
-	override stop(): void {
+	override stop(options?: TerminalStopOptions): void {
 		this.stopCount += 1;
-		super.stop();
+		super.stop(options);
 	}
 }
 
@@ -67,7 +67,9 @@ describe("createInteractiveTui", () => {
 		altTui.start();
 		await altTerminal.waitForRender();
 		expect(altTerminal.writes.some((write) => write.includes("\x1b[?1049h"))).toBe(true);
+		expect(altTerminal.writes.some((write) => write.includes("\x1b[?7l"))).toBe(false);
 		altTui.stop();
+		expect(altTerminal.writes.some((write) => write.includes("\x1b[?7h"))).toBe(false);
 	});
 
 	it("shows the configured jump-to-bottom shortcut while scrolled up", async () => {
@@ -152,12 +154,12 @@ describe("createInteractiveTui", () => {
 		expect(context.renderer.getFocusedComponent()).toBe(component);
 		expect(component.focused).toBe(true);
 		expect(invalidatedModes).toEqual(["fullscreen"]);
-		expect([terminal.startCount, terminal.stopCount]).toEqual([2, 1]);
+		expect([terminal.startCount, terminal.stopCount]).toEqual([2, 0]);
 
 		stopInteractiveTui.call(context, "resume-hint");
 
 		expect(stableUi.mode).toBe("fullscreen");
-		expect([terminal.startCount, terminal.stopCount]).toEqual([2, 2]);
+		expect([terminal.startCount, terminal.stopCount]).toEqual([2, 1]);
 	});
 });
 

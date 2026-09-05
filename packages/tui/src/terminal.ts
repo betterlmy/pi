@@ -20,6 +20,16 @@ export type KeyboardProtocolNegotiationSequence =
 	| { type: "kitty-flags"; flags: number }
 	| { type: "device-attributes" };
 
+export interface TerminalStartOptions {
+	/** Keep an active terminal session and replace only its input and resize callbacks. */
+	preserveState?: boolean;
+}
+
+export interface TerminalStopOptions {
+	/** Keep raw mode and terminal protocol state active for a replacement renderer. */
+	preserveState?: boolean;
+}
+
 export function parseKeyboardProtocolNegotiationSequence(
 	sequence: string,
 ): KeyboardProtocolNegotiationSequence | undefined {
@@ -73,10 +83,10 @@ export function normalizeAppleTerminalInput(data: string, isAppleTerminal: boole
  */
 export interface Terminal {
 	// Start the terminal with input and resize handlers
-	start(onInput: (data: string) => void, onResize: () => void): void;
+	start(onInput: (data: string) => void, onResize: () => void, options?: TerminalStartOptions): void;
 
 	// Stop the terminal and restore state
-	stop(): void;
+	stop(options?: TerminalStopOptions): void;
 
 	/**
 	 * Drain stdin before exiting to prevent Kitty key release events from
@@ -139,6 +149,7 @@ export function resolveEscapeTimeoutMs(env: NodeJS.ProcessEnv = process.env): nu
  */
 export class ProcessTerminal implements Terminal {
 	private wasRaw = false;
+	private started = false;
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
 	private _kittyProtocolActive = false;
@@ -146,6 +157,8 @@ export class ProcessTerminal implements Terminal {
 	private keyboardProtocolPushed = false;
 	private keyboardProtocolNegotiationBuffer = "";
 	private keyboardProtocolBufferFlushTimer?: ReturnType<typeof setTimeout>;
+	private autowrapDisabledByPi = false;
+	private restoreAutowrapOnStop = true;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
@@ -172,20 +185,36 @@ export class ProcessTerminal implements Terminal {
 		return this._modifyOtherKeysActive;
 	}
 
-	start(onInput: (data: string) => void, onResize: () => void): void {
+	start(onInput: (data: string) => void, onResize: () => void, options: TerminalStartOptions = {}): void {
+		const previousResizeHandler = this.resizeHandler;
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
+		if (options.preserveState && this.started) {
+			if (previousResizeHandler) process.stdout.removeListener("resize", previousResizeHandler);
+			process.stdout.on("resize", this.resizeHandler);
+			return;
+		}
 
 		// Save previous state and enable raw mode
 		this.wasRaw = process.stdin.isRaw || false;
-		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(true);
-		}
+		this.setRawMode(true);
 		process.stdin.setEncoding("utf8");
 		process.stdin.resume();
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
 		process.stdout.write("\x1b[?2004h");
+
+		// Disable DECAWM (auto-wrap) while the TUI is active. On Windows conhost/ConPTY,
+		// writing a character at the last column eagerly auto-wraps to the next physical row.
+		// The differential renderer tracks cursor position by logical row index and emits \r\n
+		// to advance, so an eager wrap causes lines to drift one row and stale content to
+		// accumulate (e.g. the editor input line being redrawn on every keystroke).
+		// Query the original DECAWM state (DECRQM) so we only restore it on stop if we
+		// actually changed it. If a parent program already disabled autowrap (e.g. via
+		// `tput rmam`), we leave it disabled instead of silently re-enabling it.
+		process.stdout.write("\x1b[?7$p");
+		process.stdout.write("\x1b[?7l");
+		this.autowrapDisabledByPi = true;
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.resizeHandler);
@@ -203,6 +232,7 @@ export class ProcessTerminal implements Terminal {
 		// Query Kitty keyboard protocol and fall back to modifyOtherKeys when DA confirms no Kitty response.
 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.queryAndEnableKittyProtocol();
+		this.started = true;
 	}
 
 	/**
@@ -218,6 +248,7 @@ export class ProcessTerminal implements Terminal {
 
 		// Forward individual sequences to the input handler
 		this.stdinBuffer.on("data", (sequence) => {
+			if (this.handleDecawmResponse(sequence)) return;
 			const negotiationSequence = this.readKeyboardProtocolNegotiationSequence(sequence);
 			if (negotiationSequence === "pending") {
 				this.scheduleKeyboardProtocolNegotiationBufferFlush();
@@ -285,6 +316,21 @@ export class ProcessTerminal implements Terminal {
 		if (!this._kittyProtocolActive) {
 			this.enableModifyOtherKeys();
 		}
+		return true;
+	}
+
+	/**
+	 * Handle a DECRQM reply for DECAWM (`CSI ? 7 ; Ps $ y`). Returns true when the
+	 * sequence was a DECRQM reply and should not be forwarded as user input.
+	 */
+	private handleDecawmResponse(sequence: string): boolean {
+		const match = sequence.match(/^\x1b\[\?7;(\d+)\$y$/);
+		if (!match) return false;
+		const value = Number.parseInt(match[1]!, 10);
+		// DECRQM values: 1 = set (enabled), 2 = reset (disabled), 3 = permanently set,
+		// 4 = permanently reset, 0 = not recognized. Only restore autowrap on stop when
+		// the terminal reported it as enabled (or did not answer at all).
+		this.restoreAutowrapOnStop = value !== 2 && value !== 4;
 		return true;
 	}
 
@@ -437,13 +483,23 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
-	stop(): void {
+	stop(options: TerminalStopOptions = {}): void {
+		if (options.preserveState) return;
 		if (this.clearProgressInterval()) {
 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
 
 		// Disable bracketed paste mode
 		process.stdout.write("\x1b[?2004l");
+
+		// Restore DECAWM (auto-wrap) before returning control to the shell, but only if
+		// we actually disabled it and the terminal reported autowrap as enabled on entry
+		// (DECRQM). If autowrap was already disabled before Pi ran, leave it as-is.
+		if (this.autowrapDisabledByPi && this.restoreAutowrapOnStop) {
+			process.stdout.write("\x1b[?7h");
+		}
+		this.autowrapDisabledByPi = false;
+		this.restoreAutowrapOnStop = true;
 
 		const shouldDisableKittyProtocol = this.keyboardProtocolPushed || this._kittyProtocolActive;
 		this.clearKeyboardProtocolNegotiationBuffer();
@@ -480,8 +536,21 @@ export class ProcessTerminal implements Terminal {
 		process.stdin.pause();
 
 		// Restore raw mode state
-		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(this.wasRaw);
+		this.setRawMode(this.wasRaw);
+		this.started = false;
+	}
+
+	/**
+	 * Set raw mode, tolerating a transient broken-pipe error that some terminals
+	 * (notably Windows conhost) emit when re-enabling raw mode after a mode switch.
+	 * Uses optional chaining so it is a no-op for non-TTY stdin, matching the
+	 * previous `if (process.stdin.setRawMode)` guard.
+	 */
+	private setRawMode(mode: boolean): void {
+		try {
+			process.stdin.setRawMode?.(mode);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EPIPE") throw err;
 		}
 	}
 

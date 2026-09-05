@@ -800,7 +800,6 @@ export class InteractiveMode {
 		const previousUi = this.renderer;
 		if (mode === previousUi.mode) return true;
 		if (previousUi.hasOverlayEntries) return false;
-
 		const components = [...previousUi.children];
 		const focus = previousUi.getFocusedComponent();
 		const terminal = previousUi.terminal;
@@ -811,7 +810,7 @@ export class InteractiveMode {
 			this.mainScreenRenderState = previousUi.captureRenderState();
 		}
 
-		previousUi.stop({ preserveScreen: true });
+		previousUi.stop({ preserveScreen: true, preserveTerminal: true });
 		previousUi.setFocus(null);
 		previousUi.clear();
 		if (TuiLayouts.isViewportTUI(previousUi)) previousUi.setLayoutRoot(undefined);
@@ -835,7 +834,7 @@ export class InteractiveMode {
 		nextUi.invalidate();
 		nextUi.setFocus(focus);
 		if (!startRenderer) return true;
-		nextUi.start();
+		nextUi.start({ preserveTerminal: true });
 		this.themeController.rebindTui();
 		this.rebindExtensionTerminalInputListeners();
 		if (
